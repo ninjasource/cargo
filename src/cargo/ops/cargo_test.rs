@@ -1,18 +1,14 @@
-use crate::core::compiler::{Compilation, CompileKind, Doctest, UnitOutput};
+use crate::core::compiler::{Compilation, CompileKind, Doctest, Unit};
 use crate::core::shell::Verbosity;
 use crate::core::{TargetKind, Workspace};
 use crate::ops;
 use crate::util::errors::CargoResult;
-use crate::util::{add_path_args, CargoTestError, Config, Progress, ProgressStyle, Test};
-use cargo_util::ProcessBuilder;
-use cargo_util::ProcessError;
-use crossbeam_utils::thread;
+use crate::util::{add_path_args, CargoTestError, Config, Test};
+use cargo_util::{ProcessBuilder, ProcessError};
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
-use std::sync::{
-    mpsc::{Receiver, Sender},
-    Arc, Mutex,
-};
-use std::thread::ThreadId;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender};
 
 pub struct TestOptions {
     pub compile_opts: ops::CompileOptions,
@@ -75,17 +71,6 @@ fn compile_tests<'a>(ws: &Workspace<'a>, options: &TestOptions) -> CargoResult<C
     Ok(compilation)
 }
 
-/// Runs the unit and integration tests of a package.
-
-enum OutOrErr {
-    Out(String),
-    Err(String),
-    /// Test process finished with an error.
-    Error(TestError),
-}
-
-type TestError = (TargetKind, String, String, anyhow::Error);
-
 fn run_unit_tests(
     config: &Config,
     options: &TestOptions,
@@ -94,72 +79,67 @@ fn run_unit_tests(
 ) -> CargoResult<(Test, Vec<ProcessError>)> {
     let cwd = config.cwd();
 
-    let mut jobs: Vec<Job> = vec![]; // jobs to run.
+    let batches: CargoResult<Vec<_>> = compilation
+        .tests
+        .iter()
+        .map(|unit_output| {
+            let exe_display = get_exe_display(&unit_output.unit, &unit_output.path, cwd);
+            let mut cmd = compilation.target_process(
+                &unit_output.path,
+                unit_output.unit.kind,
+                &unit_output.unit.pkg,
+                *&unit_output.script_meta,
+            )?;
 
-    for UnitOutput {
-        unit,
-        path,
-        script_meta,
-    } in compilation.tests.iter()
-    {
-        let test_path = unit.target.src_path().path().unwrap();
-        let path_display = path.strip_prefix(cwd).unwrap_or(path).display();
-        let exe = if let TargetKind::Test = unit.target.kind() {
-            format!(
-                "{} ({})",
-                test_path
-                    .strip_prefix(unit.pkg.root())
-                    .unwrap_or(test_path)
-                    .display(),
-                path_display
-            )
-        } else {
-            format!("unittests ({})", path_display)
-        };
+            cmd.args(test_args);
+            if unit_output.unit.target.harness() && config.shell().verbosity() == Verbosity::Quiet {
+                cmd.arg("--quiet");
+            }
 
-        let mut cmd = compilation.target_process(&path, unit.kind, &unit.pkg, *script_meta)?;
-        cmd.args(test_args);
-        if unit.target.harness() && config.shell().verbosity() == Verbosity::Quiet {
-            cmd.arg("--quiet");
-        }
-        // exec_with_streaming doesn't look like a tty so we have to be explicit
-        if !test_args.contains(&"--color=never") && config.shell().err_supports_color() {
-            cmd.arg("--color=always");
-        }
+            if !test_args.contains(&"--color=never") && config.shell().err_supports_color() {
+                cmd.arg("--color=always");
+            }
 
-        let pkg_name = unit.pkg.name().to_string();
-        let target = &unit.target;
-        let (tx, rx) = std::sync::mpsc::channel();
-        jobs.push(Job {
-            state: JobState::NotStarted,
-            cmd,
-            name: target.name().to_string(),
-            exe,
-            target_kind: target.kind().clone(),
-            pkg_name,
-            rx,
-            tx: Some(tx),
-        });
-    }
+            let cmd_display = if config.shell().verbosity() == Verbosity::Verbose {
+                Some(format!("{}", cmd))
+            } else {
+                None
+            };
 
-    let mut errors = execute_tests(jobs, config, options, compilation.tests.len(), false)?;
+            let display = TestBatchDisplay {
+                exe_display,
+                cmd_display,
+            };
 
+            let error_display = TestBatchErrorDisplay {
+                target_kind: unit_output.unit.target.kind().clone(),
+                target_name: unit_output.unit.target.name().to_string(),
+                pkg_name: unit_output.unit.pkg.name().to_string(),
+            };
+
+            Ok(TestBatch {
+                display,
+                error_display,
+                cmd,
+            })
+        })
+        .collect();
+    let batches = batches?;
+    let mut errors = run_test_batches(batches, options, config)?;
+
+    // if there is only one error then print more details about the source of that error
     if errors.len() == 1 {
-        let (kind, name, pkg_name, e) = errors.pop().unwrap();
+        let (batch, e) = errors.pop().unwrap();
         Ok((
             Test::UnitTest {
-                kind,
-                name,
-                pkg_name,
+                kind: batch.error_display.target_kind,
+                name: batch.error_display.target_name,
+                pkg_name: batch.error_display.pkg_name,
             },
-            vec![e.downcast::<ProcessError>()?],
+            vec![e],
         ))
     } else {
-        let mut res = vec![];
-        for (_, _, _, e) in errors.into_iter() {
-            res.push(e.downcast::<ProcessError>()?);
-        }
-        Ok((Test::Multiple, res))
+        Ok((Test::Multiple, errors.into_iter().map(|(_, e)| e).collect()))
     }
 }
 
@@ -170,265 +150,405 @@ fn run_doc_tests(
     compilation: &Compilation<'_>,
 ) -> CargoResult<(Test, Vec<ProcessError>)> {
     let config = ws.config();
+
     let doctest_xcompile = config.cli_unstable().doctest_xcompile;
     let doctest_in_workspace = config.cli_unstable().doctest_in_workspace;
 
-    let mut jobs = vec![];
-    let mut total = 0;
-    for doctest_info in &compilation.to_doc_test {
-        total += 1;
-        let Doctest {
-            args,
-            unstable_opts,
-            unit,
-            linker,
-            script_meta,
-        } = doctest_info;
-
-        if !doctest_xcompile {
-            match unit.kind {
-                CompileKind::Host => {}
-                CompileKind::Target(target) => {
-                    if target.short_name() != compilation.host {
-                        // Skip doctests, -Zdoctest-xcompile not enabled.
-                        continue;
+    let batches: CargoResult<Vec<_>> = compilation
+        .to_doc_test
+        .iter()
+        .filter(|doctest_info| {
+            if doctest_xcompile {
+                true
+            } else {
+                match doctest_info.unit.kind {
+                    CompileKind::Host => true,
+                    CompileKind::Target(target) => {
+                        target.short_name() == compilation.host // Skip doctests, -Zdoctest-xcompile not enabled.
                     }
                 }
             }
-        }
+        })
+        .map(|doctest_info| {
+            let Doctest {
+                args,
+                unstable_opts,
+                unit,
+                linker,
+                script_meta,
+            } = doctest_info;
 
-        let mut p = compilation.rustdoc_process(unit, *script_meta)?;
-        p.arg("--crate-name").arg(&unit.target.crate_name());
-        p.arg("--test");
+            config.shell().status("Doc-tests", unit.target.name())?;
+            let mut cmd = compilation.rustdoc_process(unit, *script_meta)?;
+            cmd.arg("--crate-name").arg(&unit.target.crate_name());
+            cmd.arg("--test");
 
-        if doctest_in_workspace {
-            add_path_args(ws, unit, &mut p);
-            // FIXME(swatinem): remove the `unstable-options` once rustdoc stabilizes the `test-run-directory` option
-            p.arg("-Z").arg("unstable-options");
-            p.arg("--test-run-directory")
-                .arg(unit.pkg.root().to_path_buf());
-        } else {
-            p.arg(unit.target.src_path().path().unwrap());
-        }
-
-        if doctest_xcompile {
-            if let CompileKind::Target(target) = unit.kind {
-                // use `rustc_target()` to properly handle JSON target paths
-                p.arg("--target").arg(target.rustc_target());
+            if !test_args.contains(&"--color=never") && config.shell().err_supports_color() {
+                cmd.arg("--color=always");
             }
-            p.arg("-Zunstable-options");
-            p.arg("--enable-per-target-ignores");
-            if let Some((runtool, runtool_args)) = compilation.target_runner(unit.kind) {
-                p.arg("--runtool").arg(runtool);
-                for arg in runtool_args {
-                    p.arg("--runtool-arg").arg(arg);
+
+            if doctest_in_workspace {
+                add_path_args(ws, unit, &mut cmd);
+                // FIXME(swatinem): remove the `unstable-options` once rustdoc stabilizes the `test-run-directory` option
+                cmd.arg("-Z").arg("unstable-options");
+                cmd.arg("--test-run-directory")
+                    .arg(unit.pkg.root().to_path_buf());
+            } else {
+                cmd.arg(unit.target.src_path().path().unwrap());
+            }
+
+            if doctest_xcompile {
+                if let CompileKind::Target(target) = unit.kind {
+                    // use `rustc_target()` to properly handle JSON target paths
+                    cmd.arg("--target").arg(target.rustc_target());
                 }
-            }
-            if let Some(linker) = linker {
-                let mut joined = OsString::from("linker=");
-                joined.push(linker);
-                p.arg("-C").arg(joined);
-            }
-        }
-
-        for &rust_dep in &[
-            &compilation.deps_output[&unit.kind],
-            &compilation.deps_output[&CompileKind::Host],
-        ] {
-            let mut arg = OsString::from("dependency=");
-            arg.push(rust_dep);
-            p.arg("-L").arg(arg);
-        }
-
-        for native_dep in compilation.native_dirs.iter() {
-            p.arg("-L").arg(native_dep);
-        }
-
-        for arg in test_args {
-            p.arg("--test-args").arg(arg);
-        }
-
-        if config.shell().verbosity() == Verbosity::Quiet {
-            p.arg("--test-args").arg("--quiet");
-        }
-
-        p.args(args);
-
-        if *unstable_opts {
-            p.arg("-Zunstable-options");
-        }
-
-        // exec_with_streaming doesn't look like a tty so we have to be explicit
-        if !test_args.contains(&"--color=never") && config.shell().err_supports_color() {
-            p.arg("--color=always");
-        }
-
-        let exe = unit.target.name().to_string();
-        let pkg_name = unit.pkg.name().to_string();
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        jobs.push(Job {
-            state: JobState::NotStarted,
-            cmd: p,
-            name: unit.target.name().to_string(),
-            exe,
-            target_kind: unit.target.kind().clone(),
-            pkg_name,
-            rx,
-            tx: Some(tx),
-        });
-    }
-    let errors = execute_tests(jobs, config, options, total, true)?;
-
-    let mut res = vec![];
-    for (_, _, _, e) in errors.into_iter() {
-        res.push(e.downcast::<ProcessError>()?);
-    }
-    Ok((Test::Doc, res))
-}
-
-fn execute_tests(
-    jobs: Vec<Job>,
-    config: &Config,
-    options: &TestOptions,
-    total: usize,
-    doc_tests: bool,
-) -> CargoResult<Vec<TestError>> {
-    thread::scope(|s| {
-        let mut errors: Vec<TestError> = Vec::new();
-        let jobs = Arc::new(Mutex::new(jobs));
-        let mut progress = Progress::with_style("Testing", ProgressStyle::Ratio, config);
-
-        // Run n test crates in parallel
-        for _ in 0..options.compile_opts.build_config.test_jobs {
-            let jobs = jobs.clone();
-            s.spawn(move |_| {
-                loop {
-                    let tx;
-                    let cmd;
-                    let name;
-                    let target_kind;
-                    let pkg_name;
-                    // Transition job to in progress and put rx in job.
-                    {
-                        let mut jobs = jobs.lock().unwrap();
-                        if let Some(mut job) = jobs
-                            .iter_mut()
-                            .filter(|job| matches!(job.state, JobState::NotStarted))
-                            .nth(0)
-                        {
-                            cmd = job.cmd.clone();
-                            name = job.name.clone();
-                            target_kind = job.target_kind.clone();
-                            pkg_name = job.pkg_name.clone();
-                            job.state = JobState::InProgress(std::thread::current().id());
-                            tx = job.tx.take().expect("tx to exist");
-                        } else {
-                            break;
-                        }
-                    }
-
-                    let result = cmd
-                        .exec_with_streaming(
-                            &mut |line| {
-                                tx.send(OutOrErr::Out(line.to_string())).unwrap();
-                                Ok(())
-                            },
-                            &mut |line| {
-                                tx.send(OutOrErr::Err(line.to_string())).unwrap();
-                                Ok(())
-                            },
-                            false,
-                        )
-                        .map_err(|e| (target_kind, name, pkg_name, e));
-                    drop(cmd);
-                    if let Err(err) = result {
-                        tx.send(OutOrErr::Error(err)).unwrap();
-                    }
-
-                    for mut job in &mut *jobs.lock().unwrap() {
-                        if let JobState::InProgress(thread_id) = job.state {
-                            if thread_id == std::thread::current().id() {
-                                job.state = JobState::Finished;
-                                break;
-                            }
-                        }
+                cmd.arg("-Zunstable-options");
+                cmd.arg("--enable-per-target-ignores");
+                if let Some((runtool, runtool_args)) = compilation.target_runner(unit.kind) {
+                    cmd.arg("--runtool").arg(runtool);
+                    for arg in runtool_args {
+                        cmd.arg("--runtool-arg").arg(arg);
                     }
                 }
-            });
-        }
+                if let Some(linker) = linker {
+                    let mut joined = OsString::from("linker=");
+                    joined.push(linker);
+                    cmd.arg("-C").arg(joined);
+                }
+            }
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
+            for &rust_dep in &[
+                &compilation.deps_output[&unit.kind],
+                &compilation.deps_output[&CompileKind::Host],
+            ] {
+                let mut arg = OsString::from("dependency=");
+                arg.push(rust_dep);
+                cmd.arg("-L").arg(arg);
+            }
 
-        // Report results in the standard order...
-        for _ in 0..total {
-            let active_names: Vec<String>;
-            let done_count;
-            let job: Job = {
-                let mut jobs = jobs.lock().unwrap();
-                done_count = total
-                    - jobs
-                        .iter()
-                        .filter(|job| {
-                            matches!(job.state, JobState::NotStarted | JobState::InProgress(_))
-                        })
-                        .count();
-                active_names = jobs
-                    .iter()
-                    .filter(|job| matches!(job.state, JobState::InProgress(_)))
-                    .map(|job| job.name.clone())
-                    .collect();
-                jobs.remove(0)
+            for native_dep in compilation.native_dirs.iter() {
+                cmd.arg("-L").arg(native_dep);
+            }
+
+            for arg in test_args {
+                cmd.arg("--test-args").arg(arg);
+            }
+
+            if config.shell().verbosity() == Verbosity::Quiet {
+                cmd.arg("--test-args").arg("--quiet");
+            }
+
+            cmd.args(args);
+
+            if *unstable_opts {
+                cmd.arg("-Zunstable-options");
+            }
+
+            let exe_display = cmd.to_string();
+
+            let error_display = TestBatchErrorDisplay {
+                target_kind: unit.target.kind().clone(),
+                target_name: unit.target.name().to_string(),
+                pkg_name: unit.pkg.name().to_string(),
             };
 
-            progress.clear();
-            config.shell().concise(|shell| {
-                shell.status(if doc_tests { "Doc-tests" } else { "Running" }, &job.exe)
-            })?;
+            Ok(TestBatch {
+                display: TestBatchDisplay {
+                    exe_display,
+                    cmd_display: None,
+                },
+                error_display,
+                cmd,
+            })
+        })
+        .collect();
+
+    let batches = batches?;
+    let errors = run_test_batches(batches, options, config)?;
+
+    let errors: Vec<_> = errors.into_iter().map(|(_, e)| e).collect();
+    Ok((Test::Doc, errors))
+}
+
+struct TestOutput {
+    pub exe_display: String,
+    pub output: Option<OutOrErr>,
+}
+
+enum OutOrErr {
+    Out(String),
+    Err(String),
+}
+
+struct TestBatch {
+    pub display: TestBatchDisplay,
+    pub error_display: TestBatchErrorDisplay,
+    pub cmd: ProcessBuilder,
+}
+
+struct TestBatchErrorDisplay {
+    pub target_kind: TargetKind,
+    pub target_name: String,
+    pub pkg_name: String,
+}
+
+#[derive(Clone)]
+struct TestBatchDisplay {
+    pub exe_display: String,
+    pub cmd_display: Option<String>,
+}
+
+fn run_test_batches(
+    batches: Vec<TestBatch>,
+    options: &TestOptions,
+    config: &Config,
+) -> CargoResult<Vec<(TestBatch, ProcessError)>> {
+    let test_jobs = options.compile_opts.build_config.test_jobs;
+
+    if test_jobs == 1 {
+        let mut errors = vec![];
+        for batch in batches {
             config
                 .shell()
-                .verbose(|shell| shell.status("Running", &job.cmd))?;
+                .concise(|shell| shell.status("Running", &batch.display.exe_display))?;
+            config
+                .shell()
+                .verbose(|shell| shell.status("Running", &batch.cmd))?;
 
-            for line in job.rx.iter() {
-                progress.clear();
-                match line {
-                    OutOrErr::Out(line) => writeln!(config.shell().out(), "{}", line).unwrap(),
-                    OutOrErr::Err(line) => writeln!(config.shell().err(), "{}", line).unwrap(),
-                    OutOrErr::Error(err) => {
-                        errors.push(err);
-                        if !options.no_fail_fast {
-                            break;
-                        }
-                    }
+            if let Err(e) = batch.cmd.exec() {
+                let e = e.downcast::<ProcessError>().unwrap();
+                errors.push((batch, e))
+            };
+        }
+
+        Ok(errors)
+    } else {
+        // used for sending messages from the run test loop to the printer loop
+        let (tx_print, rx_print) = std::sync::mpsc::channel::<TestOutput>();
+        let exe_displays: Vec<_> = batches.iter().map(|x| x.display.to_owned()).collect();
+
+        // runs the tests
+        let fail_fast = !options.no_fail_fast;
+        let run_tests_handle =
+            std::thread::spawn(move || run_tests_loop(batches, &tx_print, fail_fast, test_jobs));
+
+        // sorts and prints the test results as they come in
+        printer_loop(exe_displays, rx_print, config);
+
+        run_tests_handle.join().unwrap()
+    }
+}
+
+fn get_exe_display(unit: &Unit, path: &PathBuf, cwd: &Path) -> String {
+    if let TargetKind::Test = unit.target.kind() {
+        let test_path = unit.target.src_path().path().unwrap();
+        format!(
+            "{} ({})",
+            test_path
+                .strip_prefix(unit.pkg.root())
+                .unwrap_or(test_path)
+                .display(),
+            path.strip_prefix(cwd).unwrap_or(path).display()
+        )
+    } else {
+        format!(
+            "unittests ({})",
+            path.strip_prefix(cwd).unwrap_or(path).display()
+        )
+    }
+}
+
+fn print_display(display: &TestBatchDisplay, config: &Config) {
+    config
+        .shell()
+        .concise(|shell| shell.status("Running", &display.exe_display))
+        .unwrap();
+    config
+        .shell()
+        .verbose(|shell| {
+            shell.status("Running", {
+                match &display.cmd_display {
+                    Some(x) => x,
+                    None => "",
                 }
-                drop(progress.tick_now(
-                    done_count,
-                    total,
-                    &format!(": {}", active_names.join(", ")),
-                ));
+            })
+        })
+        .unwrap();
+}
+
+fn print_line(line: &OutOrErr, config: &Config) {
+    match line {
+        OutOrErr::Out(line) => writeln!(config.shell().out(), "{}", line).unwrap(),
+        OutOrErr::Err(line) => writeln!(config.shell().err(), "{}", line).unwrap(),
+    }
+}
+
+// this function takes an unordered heap of messages from all running threads and presents
+// them in chronological order, caching the rest
+fn printer_loop(
+    exe_displays: Vec<TestBatchDisplay>,
+    rx_print: Receiver<TestOutput>,
+    config: &Config,
+) {
+    if exe_displays.len() == 0 {
+        return;
+    }
+
+    // used to cache messages that are not ready to be displayed
+    let mut cache: HashMap<String, Vec<Option<OutOrErr>>> = exe_displays
+        .iter()
+        .map(|x| (x.exe_display.to_owned(), Vec::<Option<OutOrErr>>::new()))
+        .collect();
+
+    // used to keep track of what crate we are currently on
+    let mut queue: VecDeque<TestBatchDisplay> = exe_displays.into_iter().map(|x| x).collect();
+
+    let mut current_exe = queue.pop_front().unwrap();
+    print_display(&current_exe, config);
+    loop {
+        // receive print messages in whatever order they arrive
+        match rx_print.recv() {
+            // somewhere in the middle of a stream of messages for an exe test crate
+            Ok(TestOutput {
+                exe_display,
+                output: Some(output),
+            }) => {
+                if exe_display == current_exe.exe_display {
+                    print_line(&output, config);
+                } else {
+                    cache.get_mut(&exe_display).unwrap().push(Some(output));
+                }
+            }
+            // no more messages will arrive from this exe test crate
+            // time to start printing messages from the next crate
+            Ok(TestOutput {
+                exe_display,
+                output: None,
+            }) => {
+                if exe_display == current_exe.exe_display {
+                    // loop through the cache and print as many messages as we can
+                    // it could be that several crates have already finished
+                    'mrloopy: loop {
+                        match queue.pop_front() {
+                            Some(new_exe) => {
+                                current_exe = new_exe;
+                                print_display(&current_exe, config);
+                            }
+                            None => return,
+                        }
+
+                        for val in cache.get(&current_exe.exe_display).unwrap() {
+                            match val {
+                                Some(line) => print_line(line, config),
+                                None => {
+                                    continue 'mrloopy;
+                                }
+                            }
+                        }
+
+                        break;
+                    }
+                } else {
+                    cache.get_mut(&exe_display).unwrap().push(None);
+                }
+            }
+
+            Err(_) => {
+                // we should never normally get here
+                break;
             }
         }
-        let out: Result<_, anyhow::Error> = Ok(errors);
-        out
-    })
-    .unwrap()
+    }
 }
 
-#[derive(Debug)]
-struct Job {
-    name: String,
-    cmd: ProcessBuilder,
-    exe: String,
-    target_kind: TargetKind,
-    pkg_name: String,
-    state: JobState,
-    rx: Receiver<OutOrErr>,
-    tx: Option<Sender<OutOrErr>>,
-}
+fn run_tests_loop(
+    batches: Vec<TestBatch>,
+    tx_print: &Sender<TestOutput>,
+    fail_fast: bool,
+    test_jobs: u32,
+) -> CargoResult<Vec<(TestBatch, ProcessError)>> {
+    let (tx_done, rx_done) = std::sync::mpsc::channel::<Option<()>>();
 
-#[derive(Debug)]
-enum JobState {
-    NotStarted,
-    InProgress(ThreadId),
-    Finished,
+    // every time a job is marked as done it frees up a spot for a new job to start
+    // so marking test_jobs as done here effectively allows us to run test crates in parallel
+    for _ in 0..test_jobs {
+        tx_done.send(Some(())).unwrap();
+    }
+
+    let mut run_test_handles = vec![];
+    for batch in batches {
+        let tx_print_clone = tx_print.clone();
+        let tx_done_clone = tx_done.clone();
+
+        let handle = std::thread::spawn(
+            move || -> Result<std::process::Output, (TestBatch, ProcessError)> {
+                let mut has_error = false;
+                let exe_display = batch.display.exe_display.to_string();
+                let result = batch
+                    .cmd
+                    .exec_with_streaming(
+                        &mut |line| {
+                            if let Err(_) = tx_print_clone.send(TestOutput {
+                                exe_display: batch.display.exe_display.to_owned(),
+                                output: Some(OutOrErr::Out(line.to_string())),
+                            }) {
+                                println!("out-of-order: {}", line);
+                            }
+                            Ok(())
+                        },
+                        &mut |line| {
+                            if let Err(_) = tx_print_clone.send(TestOutput {
+                                exe_display: batch.display.exe_display.to_owned(),
+                                output: Some(OutOrErr::Err(line.to_string())),
+                            }) {
+                                eprintln!("out-of-order: {}", line);
+                            };
+                            Ok(())
+                        },
+                        false,
+                    )
+                    .map_err(|e| {
+                        has_error = true;
+                        let e = e.downcast::<ProcessError>().unwrap();
+                        (batch, e)
+                    });
+
+                tx_print_clone
+                    .send(TestOutput {
+                        exe_display,
+                        output: None,
+                    })
+                    .unwrap();
+
+                if has_error && fail_fast {
+                    // fail fast
+                    tx_done_clone.send(None).unwrap();
+                } else {
+                    // mark this job as done so we can pick up another job
+                    tx_done_clone.send(Some(())).unwrap();
+                }
+
+                result
+            },
+        );
+
+        run_test_handles.push(handle);
+
+        // this blocks until jobs are marked as done
+        if rx_done.recv().unwrap().is_none() {
+            // fail fast
+            break;
+        }
+    }
+
+    let mut errors = Vec::new();
+
+    // capture any errors
+    for handle in run_test_handles {
+        if let Err((batch, e)) = handle.join().unwrap() {
+            errors.push((batch, e));
+        }
+    }
+
+    Ok(errors)
 }

@@ -107,8 +107,9 @@ fn run_unit_tests(
             };
 
             let display = TestBatchDisplay {
-                exe_display,
-                cmd_display,
+                status: None,
+                exe: exe_display,
+                cmd: cmd_display,
             };
 
             let error_display = TestBatchErrorDisplay {
@@ -178,7 +179,6 @@ fn run_doc_tests(
                 script_meta,
             } = doctest_info;
 
-            config.shell().status("Doc-tests", unit.target.name())?;
             let mut cmd = compilation.rustdoc_process(unit, *script_meta)?;
             cmd.arg("--crate-name").arg(&unit.target.crate_name());
             cmd.arg("--test");
@@ -254,8 +254,9 @@ fn run_doc_tests(
 
             Ok(TestBatch {
                 display: TestBatchDisplay {
-                    exe_display,
-                    cmd_display: None,
+                    status: Some(("Doc-tests".into(), unit.target.name().to_string())),
+                    exe: exe_display,
+                    cmd: None,
                 },
                 error_display,
                 cmd,
@@ -294,8 +295,9 @@ struct TestBatchErrorDisplay {
 
 #[derive(Clone)]
 struct TestBatchDisplay {
-    pub exe_display: String,
-    pub cmd_display: Option<String>,
+    pub status: Option<(String, String)>,
+    pub exe: String,
+    pub cmd: Option<String>,
 }
 
 fn run_test_batches(
@@ -308,12 +310,7 @@ fn run_test_batches(
     if test_jobs == 1 {
         let mut errors = vec![];
         for batch in batches {
-            config
-                .shell()
-                .concise(|shell| shell.status("Running", &batch.display.exe_display))?;
-            config
-                .shell()
-                .verbose(|shell| shell.status("Running", &batch.cmd))?;
+            print_display(&batch.display, config)?;
 
             if let Err(e) = batch.cmd.exec() {
                 let e = e.downcast::<ProcessError>().unwrap();
@@ -333,7 +330,7 @@ fn run_test_batches(
             std::thread::spawn(move || run_tests_loop(batches, &tx_print, fail_fast, test_jobs));
 
         // sorts and prints the test results as they come in
-        printer_loop(exe_displays, rx_print, config);
+        printer_loop(exe_displays, rx_print, config)?;
 
         run_tests_handle.join().unwrap()
     }
@@ -358,29 +355,32 @@ fn get_exe_display(unit: &Unit, path: &PathBuf, cwd: &Path) -> String {
     }
 }
 
-fn print_display(display: &TestBatchDisplay, config: &Config) {
+// TODO: make this better. What is the default for shell?
+fn print_display(display: &TestBatchDisplay, config: &Config) -> CargoResult<()> {
+    if let Some((status, message)) = &display.status {
+        config.shell().status(status, message)?;
+    }
+
     config
         .shell()
-        .concise(|shell| shell.status("Running", &display.exe_display))
-        .unwrap();
-    config
-        .shell()
-        .verbose(|shell| {
-            shell.status("Running", {
-                match &display.cmd_display {
-                    Some(x) => x,
-                    None => "",
-                }
-            })
-        })
-        .unwrap();
+        .concise(|shell| shell.status("Running", &display.exe))?;
+
+    if let Some(message) = &display.cmd {
+        config
+            .shell()
+            .verbose(|shell| shell.status("Running", message))?;
+    }
+
+    Ok(())
 }
 
-fn print_line(line: &OutOrErr, config: &Config) {
+fn print_line(line: &OutOrErr, config: &Config) -> CargoResult<()> {
     match line {
-        OutOrErr::Out(line) => writeln!(config.shell().out(), "{}", line).unwrap(),
-        OutOrErr::Err(line) => writeln!(config.shell().err(), "{}", line).unwrap(),
+        OutOrErr::Out(line) => writeln!(config.shell().out(), "{}", line)?,
+        OutOrErr::Err(line) => writeln!(config.shell().err(), "{}", line)?,
     }
+
+    Ok(())
 }
 
 // this function takes an unordered heap of messages from all running threads and presents
@@ -389,22 +389,22 @@ fn printer_loop(
     exe_displays: Vec<TestBatchDisplay>,
     rx_print: Receiver<TestOutput>,
     config: &Config,
-) {
+) -> CargoResult<()> {
     if exe_displays.len() == 0 {
-        return;
+        return Ok(());
     }
 
     // used to cache messages that are not ready to be displayed
     let mut cache: HashMap<String, Vec<Option<OutOrErr>>> = exe_displays
         .iter()
-        .map(|x| (x.exe_display.to_owned(), Vec::<Option<OutOrErr>>::new()))
+        .map(|x| (x.exe.to_owned(), Vec::<Option<OutOrErr>>::new()))
         .collect();
 
     // used to keep track of what crate we are currently on
     let mut queue: VecDeque<TestBatchDisplay> = exe_displays.into_iter().map(|x| x).collect();
 
-    let mut current_exe = queue.pop_front().unwrap();
-    print_display(&current_exe, config);
+    let mut current_display = queue.pop_front().unwrap();
+    print_display(&current_display, config)?;
     loop {
         // receive print messages in whatever order they arrive
         match rx_print.recv() {
@@ -413,8 +413,8 @@ fn printer_loop(
                 exe_display,
                 output: Some(output),
             }) => {
-                if exe_display == current_exe.exe_display {
-                    print_line(&output, config);
+                if exe_display == current_display.exe {
+                    print_line(&output, config)?;
                 } else {
                     cache.get_mut(&exe_display).unwrap().push(Some(output));
                 }
@@ -425,21 +425,21 @@ fn printer_loop(
                 exe_display,
                 output: None,
             }) => {
-                if exe_display == current_exe.exe_display {
+                if exe_display == current_display.exe {
                     // loop through the cache and print as many messages as we can
                     // it could be that several crates have already finished
                     'mrloopy: loop {
                         match queue.pop_front() {
                             Some(new_exe) => {
-                                current_exe = new_exe;
-                                print_display(&current_exe, config);
+                                current_display = new_exe;
+                                print_display(&current_display, config)?;
                             }
-                            None => return,
+                            None => return Ok(()),
                         }
 
-                        for val in cache.get(&current_exe.exe_display).unwrap() {
+                        for val in cache.get(&current_display.exe).unwrap() {
                             match val {
-                                Some(line) => print_line(line, config),
+                                Some(line) => print_line(line, config)?,
                                 None => {
                                     continue 'mrloopy;
                                 }
@@ -459,6 +459,8 @@ fn printer_loop(
             }
         }
     }
+
+    Ok(())
 }
 
 fn run_tests_loop(
@@ -483,13 +485,13 @@ fn run_tests_loop(
         let handle = std::thread::spawn(
             move || -> Result<std::process::Output, (TestBatch, ProcessError)> {
                 let mut has_error = false;
-                let exe_display = batch.display.exe_display.to_string();
+                let exe_display = batch.display.exe.to_string();
                 let result = batch
                     .cmd
                     .exec_with_streaming(
                         &mut |line| {
                             if let Err(_) = tx_print_clone.send(TestOutput {
-                                exe_display: batch.display.exe_display.to_owned(),
+                                exe_display: batch.display.exe.to_owned(),
                                 output: Some(OutOrErr::Out(line.to_string())),
                             }) {
                                 println!("out-of-order: {}", line);
@@ -498,7 +500,7 @@ fn run_tests_loop(
                         },
                         &mut |line| {
                             if let Err(_) = tx_print_clone.send(TestOutput {
-                                exe_display: batch.display.exe_display.to_owned(),
+                                exe_display: batch.display.exe.to_owned(),
                                 output: Some(OutOrErr::Err(line.to_string())),
                             }) {
                                 eprintln!("out-of-order: {}", line);
